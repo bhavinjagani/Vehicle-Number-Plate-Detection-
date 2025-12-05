@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+venv/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.cursor/
+
+# Dataset files (large)
+ANPR Yolo.v2i.yolov9/
+data/
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.avi
+*.mov
+
+# Model weights (large)
+*.pt
+*.pth
+*.onnx
+*.engine
+weights/
+
+# Training runs and outputs
+runs/
+artifacts/
+wandb/
+mlruns/
+
+# External repositories (submodules or cloned)
+external/
+
+# Logs
+*.log
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+
+# EasyOCR models
+~/.EasyOCR/
+

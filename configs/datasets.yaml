@@ -1,64 +1,24 @@
-# Template for merging multiple ALPR datasets into a single YOLO-ready corpus.
-# Update the absolute/relative paths below before running:
-#   python src/data/prepare_dataset.py --config configs/datasets.yaml
-
 output_root: data/processed
 splits: ["train", "val", "test"]
-merge_strategy: copy  # copy | symlink
-limit_per_split: null # optionally cap items per split for quick experiments
+merge_strategy: copy
+limit_per_split: null
 
 datasets:
+  - name: ANPR Yolo.v2i.yolov9
+    enabled: true
+    splits:
+      train:
+        images: ANPR Yolo.v2i.yolov9/train/images
+        labels: ANPR Yolo.v2i.yolov9/train/labels
+      val:
+        images: ANPR Yolo.v2i.yolov9/valid/images
+        labels: ANPR Yolo.v2i.yolov9/valid/labels
+      test:
+        images: ANPR Yolo.v2i.yolov9/test/images
+        labels: ANPR Yolo.v2i.yolov9/test/labels
   - name: openalpr
-    enabled: true
-    license: "OpenALPR Benchmark (see upstream repo for terms)"
-    splits:
-      train:
-        images: /path/to/openalpr/train/images
-        labels: /path/to/openalpr/train/labels
-      val:
-        images: /path/to/openalpr/val/images
-        labels: /path/to/openalpr/val/labels
-      test:
-        images: /path/to/openalpr/test/images
-        labels: /path/to/openalpr/test/labels
-
+    enabled: false
   - name: indian
-    enabled: true
-    license: "Indian Licence Plate Dataset (Kaggle, CC BY-NC-SA 4.0)"
-    splits:
-      train:
-        images: /path/to/indian/train/images
-        labels: /path/to/indian/train/labels
-      val:
-        images: /path/to/indian/val/images
-        labels: /path/to/indian/val/labels
-      test:
-        images: /path/to/indian/test/images
-        labels: /path/to/indian/test/labels
-
+    enabled: false
   - name: aolp
-    enabled: true
-    license: "AOLP (Academia Sinica) - research only"
-    splits:
-      train:
-        images: /path/to/aolp/train/images
-        labels: /path/to/aolp/train/labels
-      val:
-        images: /path/to/aolp/val/images
-        labels: /path/to/aolp/val/labels
-      test:
-        images: /path/to/aolp/test/images
-        labels: /path/to/aolp/test/labels
-
-# Optional augmentations toggled during preprocessing (kept for metadata only).
-augmentations:
-  horizontal_flip: true
-  random_crop: false
-  color_jitter: true
-  blur: false
-
-# Metadata for downstream reporting
-notes:
-  prepared_by: "Update with your names"
-  purpose: "Dual YOLOv9/YOLOv5 ALPR benchmarking"
-  created_at: "YYYY-MM-DD"
+    enabled: false
