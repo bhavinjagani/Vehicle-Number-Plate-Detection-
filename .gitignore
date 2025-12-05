@@ -68,3 +68,4 @@ Thumbs.db
 # EasyOCR models
 ~/.EasyOCR/
 
+*.zip
