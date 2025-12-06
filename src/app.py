@@ -1,35 +1,34 @@
 """
-ANPR Web Application - YOLOv5 & YOLOv9
-Proper solution with subprocess isolation for YOLOv9.
+ANPR Web Application - Vehicle Number Plate Detection UI
+Upload a video and detect license plates in real-time!
+Supports both YOLOv5 and YOLOv9 models.
 """
 
 import gradio as gr
 import cv2
 import numpy as np
 import tempfile
-import subprocess
 import sys
-import json
-import os
 from pathlib import Path
 import torch
 import easyocr
 from collections import defaultdict
+import subprocess
+import json
 
-# Paths
+# Project paths
 PROJECT_ROOT = Path(__file__).parent.parent
-SRC_DIR = Path(__file__).parent
-YOLOV5_PATH = PROJECT_ROOT / "external" / "yolov5"
-YOLOV9_DETECTOR = SRC_DIR / "yolov9_detect.py"
+
+# Global OCR reader
+ocr_reader = None
+
+# Model paths
 YOLOV5_WEIGHTS = PROJECT_ROOT / "runs" / "train_yolov5" / "exp" / "weights" / "best.pt"
 YOLOV9_WEIGHTS = PROJECT_ROOT / "runs" / "train_yolov9" / "exp" / "weights" / "best.pt"
 
-# Global
-ocr_reader = None
-yolov5_model = None
-
 
 def get_device():
+    """Detect best available device"""
     if torch.cuda.is_available():
         return "cuda"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -37,309 +36,358 @@ def get_device():
     return "cpu"
 
 
+def load_yolov5_model():
+    """Load YOLOv5 model in isolated context"""
+    # Clear any conflicting modules
+    mods_to_clear = [k for k in sys.modules.keys() if k.startswith(('models.', 'utils.')) and 'gradio' not in k]
+    for m in mods_to_clear:
+        del sys.modules[m]
+    
+    # Set up path
+    yolov5_path = str(PROJECT_ROOT / "external" / "yolov5")
+    if yolov5_path not in sys.path:
+        sys.path.insert(0, yolov5_path)
+    
+    # Import YOLOv5 specific modules
+    from models.common import DetectMultiBackend
+    from utils.general import non_max_suppression, scale_boxes
+    from utils.torch_utils import select_device
+    
+    device = select_device(get_device())
+    model = DetectMultiBackend(str(YOLOV5_WEIGHTS), device=device, fp16=False)
+    model.warmup(imgsz=(1, 3, 640, 640))
+    
+    return model, device
+
+
 def load_ocr():
+    """Load OCR reader"""
     global ocr_reader
     if ocr_reader is None:
-        print("📝 Loading EasyOCR...")
+        print("Loading EasyOCR...")
         ocr_reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
-        print("✅ OCR loaded!")
+        print("✓ OCR loaded!")
     return ocr_reader
 
 
-def load_yolov5():
-    """Load YOLOv5 in main process"""
-    global yolov5_model
-    if yolov5_model is None:
-        print("📦 Loading YOLOv5...")
-        if str(YOLOV5_PATH) not in sys.path:
-            sys.path.insert(0, str(YOLOV5_PATH))
-        yolov5_model = torch.hub.load(
-            str(YOLOV5_PATH), 'custom', 
-            path=str(YOLOV5_WEIGHTS), 
-            source='local',
-            force_reload=True
-        )
-        yolov5_model.conf = 0.15
-        yolov5_model.iou = 0.45
-        print("✅ YOLOv5 loaded!")
-    return yolov5_model
-
-
-def run_yolov5(frame, conf):
-    """Run YOLOv5 detection"""
-    model = load_yolov5()
-    model.conf = conf
-    results = model(frame)
-    return results.xyxy[0].cpu().numpy().tolist()
-
-
-def run_yolov9(image_path, conf):
-    """Run YOLOv9 via subprocess"""
+def preprocess_plate_for_ocr(plate_img):
+    """Enhanced preprocessing for better OCR results"""
+    if plate_img is None or plate_img.size == 0:
+        return None
     try:
-        cmd = [
-            sys.executable,
-            str(YOLOV9_DETECTOR),
-            "--image", str(image_path),
-            "--weights", str(YOLOV9_WEIGHTS),
-            "--conf", str(conf)
-        ]
+        h, w = plate_img.shape[:2]
+        if w < 100:
+            scale = 200 / w
+            plate_img = cv2.resize(plate_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=str(PROJECT_ROOT)
-        )
+        if len(plate_img.shape) == 3:
+            gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = plate_img
         
-        # Parse output
-        for line in result.stdout.split('\n'):
-            if line.startswith("RESULT:"):
-                data = line.replace("RESULT:", "")
-                return json.loads(data)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        denoised = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)
         
-        if result.stderr:
-            print(f"YOLOv9 stderr: {result.stderr[:200]}")
+        kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+        sharpened = cv2.filter2D(denoised, -1, kernel)
         
-        return []
-    except subprocess.TimeoutExpired:
-        print("YOLOv9 timeout!")
-        return []
-    except Exception as e:
-        print(f"YOLOv9 error: {e}")
-        return []
+        return sharpened
+    except:
+        return None
 
 
-def get_models():
-    models = []
-    if YOLOV5_WEIGHTS.exists():
-        models.append("🟢 YOLOv5")
-    if YOLOV9_WEIGHTS.exists():
-        models.append("🟠 YOLOv9")
-    return models if models else ["No models"]
-
-
-def clean_text(text):
+def clean_plate_text(text):
+    """Clean and validate plate text"""
     if not text:
         return ""
     cleaned = ''.join(c for c in text.upper() if c.isalnum() or c == ' ')
-    return ' '.join(cleaned.split()) if len(cleaned) >= 2 else ""
+    cleaned = ' '.join(cleaned.split())
+    return cleaned if len(cleaned) >= 2 else ""
 
 
-def run_ocr(plate_img, ocr):
+def run_ocr_on_plate(plate_img, ocr_reader):
+    """Run OCR with multiple preprocessing attempts"""
     if plate_img is None or plate_img.size == 0:
         return ""
-    try:
-        h, w = plate_img.shape[:2]
-        if w < 80:
-            plate_img = cv2.resize(plate_img, None, fx=120/w, fy=120/w)
-        result = ocr.readtext(plate_img, detail=0, paragraph=True)
-        return clean_text(' '.join(result)) if result else ""
-    except:
-        return ""
-
-
-def detect(frame, model_choice, conf):
-    """Run detection with selected model"""
-    is_yolov5 = "YOLOv5" in model_choice
     
-    if is_yolov5:
-        return run_yolov5(frame, conf)
-    else:
-        # Save to temp file for YOLOv9 subprocess
-        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
-            cv2.imwrite(f.name, frame)
-            preds = run_yolov9(f.name, conf)
-            os.unlink(f.name)
-            return preds
+    results = []
+    
+    try:
+        ocr_result = ocr_reader.readtext(plate_img, detail=0, paragraph=True)
+        if ocr_result:
+            results.extend(ocr_result)
+    except:
+        pass
+    
+    preprocessed = preprocess_plate_for_ocr(plate_img)
+    if preprocessed is not None:
+        try:
+            ocr_result = ocr_reader.readtext(preprocessed, detail=0, paragraph=True)
+            if ocr_result:
+                results.extend(ocr_result)
+        except:
+            pass
+    
+    all_text = ' '.join(results)
+    return clean_plate_text(all_text)
 
 
-def process_frame(frame, model_choice, ocr, conf):
-    """Process single frame"""
-    h, w = frame.shape[:2]
+def run_yolov5_detection(frame, conf_threshold=0.15):
+    """Run YOLOv5 detection using torch.hub"""
+    # Use torch.hub with YOLOv5
+    yolov5_path = str(PROJECT_ROOT / "external" / "yolov5")
+    
+    # Clear modules
+    mods = [k for k in list(sys.modules.keys()) if k.startswith(('models.', 'utils.')) and 'gradio' not in k]
+    for m in mods:
+        try:
+            del sys.modules[m]
+        except:
+            pass
+    
+    model = torch.hub.load(
+        yolov5_path,
+        'custom',
+        path=str(YOLOV5_WEIGHTS),
+        source='local',
+        force_reload=False
+    )
+    model.conf = conf_threshold
+    model.iou = 0.45
+    
+    results = model(frame)
+    return results.xyxy[0].cpu().numpy()
+
+
+def run_yolov9_detection(frame, conf_threshold=0.15):
+    """Run YOLOv9 detection using torch.hub"""
+    yolov9_path = str(PROJECT_ROOT / "external" / "yolov9")
+    
+    # Clear modules
+    mods = [k for k in list(sys.modules.keys()) if k.startswith(('models.', 'utils.')) and 'gradio' not in k]
+    for m in mods:
+        try:
+            del sys.modules[m]
+        except:
+            pass
+    
+    model = torch.hub.load(
+        yolov9_path,
+        'custom',
+        path=str(YOLOV9_WEIGHTS),
+        source='local',
+        force_reload=False
+    )
+    model.conf = conf_threshold
+    model.iou = 0.45
+    
+    results = model(frame)
+    return results.xyxy[0].cpu().numpy()
+
+
+def process_frame_simple(frame, model_name, ocr_reader, conf_threshold=0.15):
+    """Process a single frame - simplified version"""
     detections = []
     
-    is_yolov5 = "YOLOv5" in model_choice
-    color = (0, 255, 0) if is_yolov5 else (0, 165, 255)
+    # Enhance frame
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    enhanced = cv2.merge([l, a, b])
+    enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
     
-    preds = detect(frame, model_choice, conf)
+    # Run detection based on model
+    if model_name == "yolov5":
+        preds = run_yolov5_detection(enhanced, conf_threshold)
+    else:
+        preds = run_yolov9_detection(enhanced, conf_threshold)
+    
+    h, w = frame.shape[:2]
     
     for pred in preds:
-        x1, y1, x2, y2, confidence, cls = pred[:6]
-        if confidence < conf:
+        x1, y1, x2, y2, conf, cls = pred
+        if conf < conf_threshold:
             continue
         
-        pad = 3
-        x1, y1 = max(0, int(x1) - pad), max(0, int(y1) - pad)
-        x2, y2 = min(w, int(x2) + pad), min(h, int(y2) + pad)
+        pad = 5
+        x1 = max(0, int(x1) - pad)
+        y1 = max(0, int(y1) - pad)
+        x2 = min(w, int(x2) + pad)
+        y2 = min(h, int(y2) + pad)
         
         plate_img = frame[y1:y2, x1:x2]
-        plate_text = run_ocr(plate_img, ocr)
+        plate_text = run_ocr_on_plate(plate_img, ocr_reader)
         
         detections.append({
             'bbox': (x1, y1, x2, y2),
-            'conf': float(confidence),
+            'conf': conf,
             'text': plate_text
         })
         
-        # Draw box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        color = (0, 255, 0) if model_name == "yolov5" else (0, 165, 255)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        
         label = plate_text if plate_text else "Plate"
-        cv2.rectangle(frame, (x1, y1 - 22), (x1 + len(label) * 11 + 5, y1), color, -1)
-        cv2.putText(frame, label, (x1 + 3, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        conf_label = f"{conf:.0%}"
+        
+        (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.rectangle(frame, (x1, y1 - text_h - 10), (x1 + text_w + 10, y1), color, -1)
+        cv2.putText(frame, label, (x1 + 5, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+        
+        (conf_w, conf_h), _ = cv2.getTextSize(conf_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(frame, (x2 - conf_w - 10, y1), (x2, y1 - conf_h - 8), (255, 200, 0), -1)
+        cv2.putText(frame, conf_label, (x2 - conf_w - 5, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
     
     return frame, detections
 
 
-def process_video(video_path, model_choice, conf, progress=gr.Progress()):
+def process_video(video_path, model_choice, conf_threshold):
+    """Process video with selected model"""
     if video_path is None:
-        return None, "⚠️ Upload a video first!"
+        return None, "⚠️ Please upload a video first!"
     
-    model_name = "YOLOv5" if "YOLOv5" in model_choice else "YOLOv9"
-    emoji = "🟢" if "YOLOv5" in model_choice else "🟠"
-    color = (0, 255, 0) if "YOLOv5" in model_choice else (0, 165, 255)
+    model_name = "yolov5" if "YOLOv5" in model_choice else "yolov9"
     
     try:
         ocr = load_ocr()
         
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None, "❌ Could not open video"
+        
         fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        output = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
-        out = cv2.VideoWriter(output, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+        output_path = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
         
-        count = 0
-        all_det = []
-        plates = defaultdict(int)
+        frame_count = 0
+        all_detections = []
+        plate_tracker = defaultdict(int)
         
-        # Skip more frames for YOLOv9 (subprocess is slower)
-        if "YOLOv9" in model_choice:
-            skip = max(10, total // 30)
-        else:
-            skip = max(1, total // 100)
-        
-        last_det = []
+        print(f"Processing with {model_name.upper()}...")
         
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
             
-            count += 1
-            if count % 5 == 0:
-                progress(count / total, f"{model_name}: Frame {count}/{total}")
+            frame_count += 1
             
-            if count % skip == 0 or count == 1:
-                annotated, det = process_frame(frame.copy(), model_choice, ocr, conf)
-                last_det = det
-            else:
+            try:
+                annotated, detections = process_frame_simple(frame.copy(), model_name, ocr, conf_threshold)
+            except Exception as e:
+                print(f"Frame {frame_count} error: {e}")
                 annotated = frame.copy()
-                # Redraw last detections
-                for d in last_det:
-                    x1, y1, x2, y2 = d['bbox']
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-                    label = d['text'] if d['text'] else "Plate"
-                    cv2.rectangle(annotated, (x1, y1 - 22), (x1 + len(label) * 11 + 5, y1), color, -1)
-                    cv2.putText(annotated, label, (x1 + 3, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-                det = last_det
+                detections = []
             
-            for d in det:
-                if d['text']:
-                    plates[d['text']] += 1
-            all_det.extend(det)
+            for det in detections:
+                if det['text']:
+                    plate_tracker[det['text']] += 1
+                all_detections.append(det)
             
-            # HUD
-            cv2.rectangle(annotated, (5, 5), (220, 55), (0, 0, 0), -1)
-            cv2.putText(annotated, f"{model_name} ANPR", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            cv2.putText(annotated, f"Frame {count}/{total}", (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            # Overlay
+            overlay = annotated.copy()
+            cv2.rectangle(overlay, (0, 0), (width, 90), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, annotated, 0.4, 0, annotated)
+            
+            model_color = (0, 255, 0) if model_name == "yolov5" else (0, 165, 255)
+            cv2.putText(annotated, f"{model_name.upper()}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, model_color, 2)
+            cv2.putText(annotated, f"Frame: {frame_count}/{total_frames}", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(annotated, f"Plates: {len(detections)}", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            if detections and detections[0]['text']:
+                cv2.putText(annotated, f"Plate: {detections[0]['text']}", (width - 350, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             
             out.write(annotated)
+            
+            if frame_count % 30 == 0:
+                print(f"Processed {frame_count}/{total_frames}")
         
         cap.release()
         out.release()
         
-        unique = sorted(plates.items(), key=lambda x: x[1], reverse=True)
+        unique_plates = sorted(plate_tracker.items(), key=lambda x: x[1], reverse=True)
         
-        summary = f"""## ✅ Complete!
+        emoji = "🟢" if model_name == "yolov5" else "🟠"
+        summary = f"""
+## ✅ Done!
 
-**Model:** {emoji} {model_name}
-**Frames:** {total} @ {fps} FPS
-**Processed:** Every {skip} frames
+**Model:** {emoji} {model_name.upper()}
+**Video:** {total_frames} frames, {width}x{height}, {fps} FPS
 
-### 📊 Results
-- **Detections:** {len(all_det)}
-- **Unique Plates:** {len(unique)}
+**Results:** {len(all_detections)} detections, {len(unique_plates)} unique plates
 
-### 🚗 Plates Found:
+**Plates Found:**
 """
-        for p, c in unique[:10]:
-            summary += f"\n- **`{p}`** ({c}×)"
-        if not unique:
-            summary += "\n⚠️ No plates detected. Try lower confidence."
+        for plate, count in unique_plates[:10]:
+            summary += f"\n- `{plate}` (seen {count}x)"
         
-        return output, summary
+        if not unique_plates:
+            summary += "\n⚠️ No plates found. Try lower confidence."
+        
+        return output_path, summary
+        
     except Exception as e:
         import traceback
         return None, f"❌ Error: {e}\n```\n{traceback.format_exc()}\n```"
 
 
-def process_image(image, model_choice, conf):
+def process_image(image, model_choice, conf_threshold):
+    """Process image with selected model"""
     if image is None:
-        return None, "⚠️ Upload an image first!"
+        return None, "⚠️ Please upload an image!"
     
-    model_name = "YOLOv5" if "YOLOv5" in model_choice else "YOLOv9"
-    emoji = "🟢" if "YOLOv5" in model_choice else "🟠"
+    model_name = "yolov5" if "YOLOv5" in model_choice else "yolov9"
     
     try:
         ocr = load_ocr()
         frame = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        annotated, det = process_frame(frame, model_choice, ocr, conf)
+        
+        annotated, detections = process_frame_simple(frame, model_name, ocr, conf_threshold)
         result = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
         
-        summary = f"## {emoji} {model_name} Detection\n\n**Found:** {len(det)} plate(s)\n\n"
-        if det:
-            for i, d in enumerate(det, 1):
-                text = d['text'] if d['text'] else "(unreadable)"
-                summary += f"{i}. **`{text}`** — {d['conf']:.0%}\n"
+        emoji = "🟢" if model_name == "yolov5" else "🟠"
+        summary = f"## {emoji} {model_name.upper()} - {len(detections)} plate(s)\n\n"
+        
+        if detections:
+            for det in detections:
+                plate = det['text'] if det['text'] else "(unreadable)"
+                summary += f"- **`{plate}`** ({det['conf']:.0%})\n"
         else:
-            summary += "⚠️ No plates detected. Try lower confidence."
+            summary += "No plates detected."
         
         return result, summary
+        
     except Exception as e:
         import traceback
         return None, f"❌ Error: {e}\n```\n{traceback.format_exc()}\n```"
 
 
-# ============== STARTUP ==============
-print("=" * 50)
-print("🚀 ANPR - YOLOv5 + YOLOv9")
-print(f"📦 YOLOv5: {'✓' if YOLOV5_WEIGHTS.exists() else '✗'} {YOLOV5_WEIGHTS}")
-print(f"📦 YOLOv9: {'✓' if YOLOV9_WEIGHTS.exists() else '✗'} {YOLOV9_WEIGHTS}")
-print(f"🔧 YOLOv9 detector: {YOLOV9_DETECTOR}")
-print(f"🔧 Device: {get_device()}")
-print("=" * 50)
+# Check model availability
+def get_available_models():
+    models = []
+    if YOLOV5_WEIGHTS.exists():
+        models.append("🟢 YOLOv5 (Fast & Accurate)")
+    if YOLOV9_WEIGHTS.exists():
+        models.append("🟠 YOLOv9 (Newer Architecture)")
+    return models if models else ["No models found!"]
 
-models = get_models()
 
-# Pre-load YOLOv5
-if YOLOV5_WEIGHTS.exists():
-    print("⏳ Pre-loading YOLOv5...")
-    try:
-        load_yolov5()
-    except Exception as e:
-        print(f"⚠️ YOLOv5 load failed: {e}")
+# Create UI
+print("🚀 Starting ANPR App...")
 
-# ============== UI ==============
-with gr.Blocks(title="ANPR - License Plate Detection") as app:
+available = get_available_models()
+
+with gr.Blocks(title="ANPR") as app:
     gr.Markdown("""
     # 🚗 License Plate Detection (ANPR)
-    ### YOLOv5 + YOLOv9 + EasyOCR
-    
-    Select model and upload video/image to detect plates.
-    
+    ### YOLOv5 / YOLOv9 + EasyOCR
     ---
     """)
     
@@ -347,40 +395,33 @@ with gr.Blocks(title="ANPR - License Plate Detection") as app:
         with gr.TabItem("🎬 Video"):
             with gr.Row():
                 with gr.Column():
-                    video_in = gr.Video(label="📤 Upload Video")
-                    model_vid = gr.Radio(models, value=models[0], label="🤖 Model")
-                    conf_vid = gr.Slider(0.05, 0.9, 0.15, 0.05, label="🎯 Confidence")
-                    btn_vid = gr.Button("🔍 Detect Plates", variant="primary", size="lg")
+                    vid_in = gr.Video(label="Upload Video")
+                    vid_model = gr.Radio(available, value=available[0], label="Model")
+                    vid_conf = gr.Slider(0.05, 0.9, 0.15, 0.05, label="Confidence")
+                    vid_btn = gr.Button("🔍 Detect", variant="primary")
                 with gr.Column():
-                    video_out = gr.Video(label="📹 Result")
-                    txt_vid = gr.Markdown()
-            btn_vid.click(process_video, [video_in, model_vid, conf_vid], [video_out, txt_vid])
+                    vid_out = gr.Video(label="Result")
+                    vid_txt = gr.Markdown()
+            
+            vid_btn.click(process_video, [vid_in, vid_model, vid_conf], [vid_out, vid_txt])
         
         with gr.TabItem("🖼️ Image"):
             with gr.Row():
                 with gr.Column():
-                    img_in = gr.Image(label="📤 Upload Image", type="numpy")
-                    model_img = gr.Radio(models, value=models[0], label="🤖 Model")
-                    conf_img = gr.Slider(0.05, 0.9, 0.15, 0.05, label="🎯 Confidence")
-                    btn_img = gr.Button("🔍 Detect Plates", variant="primary", size="lg")
+                    img_in = gr.Image(label="Upload Image", type="numpy")
+                    img_model = gr.Radio(available, value=available[0], label="Model")
+                    img_conf = gr.Slider(0.05, 0.9, 0.15, 0.05, label="Confidence")
+                    img_btn = gr.Button("🔍 Detect", variant="primary")
                 with gr.Column():
-                    img_out = gr.Image(label="🎯 Result")
-                    txt_img = gr.Markdown()
-            btn_img.click(process_image, [img_in, model_img, conf_img], [img_out, txt_img])
+                    img_out = gr.Image(label="Result")
+                    img_txt = gr.Markdown()
+            
+            img_btn.click(process_image, [img_in, img_model, img_conf], [img_out, img_txt])
     
-    gr.Markdown("""
-    ---
-    | Model | Speed | Method |
-    |-------|-------|--------|
-    | 🟢 **YOLOv5** | Fast ⚡ | Main process |
-    | 🟠 **YOLOv9** | Slower | Subprocess (isolated) |
-    
-    *Computer Vision Project - SEM3*
-    """)
-
+    gr.Markdown("---\n*Computer Vision Project - SEM3*")
 
 if __name__ == "__main__":
-    print("\n" + "=" * 50)
-    print("📍 Open: http://localhost:7860")
-    print("=" * 50 + "\n")
+    print("=" * 40)
+    print("📍 http://localhost:7860")
+    print("=" * 40)
     app.launch(server_name="0.0.0.0", server_port=7860)
