@@ -161,29 +161,56 @@ def run_yolov5_detection(frame, conf_threshold=0.15):
 
 
 def run_yolov9_detection(frame, conf_threshold=0.15):
-    """Run YOLOv9 detection using torch.hub"""
-    yolov9_path = str(PROJECT_ROOT / "external" / "yolov9")
+    """Run YOLOv9 detection via subprocess to avoid module conflicts"""
+    import tempfile
+    import os
     
-    # Clear modules
-    mods = [k for k in list(sys.modules.keys()) if k.startswith(('models.', 'utils.')) and 'gradio' not in k]
-    for m in mods:
-        try:
-            del sys.modules[m]
-        except:
-            pass
+    # Save frame to temp file
+    temp_img = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+    temp_path = temp_img.name
+    temp_img.close()
     
-    model = torch.hub.load(
-        yolov9_path,
-        'custom',
-        path=str(YOLOV9_WEIGHTS),
-        source='local',
-        force_reload=False
-    )
-    model.conf = conf_threshold
-    model.iou = 0.45
-    
-    results = model(frame)
-    return results.xyxy[0].cpu().numpy()
+    try:
+        # Save the frame as image
+        cv2.imwrite(temp_path, frame)
+        
+        # Run YOLOv9 in separate process
+        script_path = PROJECT_ROOT / "src" / "yolov9_detect.py"
+        result = subprocess.run(
+            [
+                sys.executable, str(script_path),
+                "--image", temp_path,
+                "--weights", str(YOLOV9_WEIGHTS),
+                "--conf", str(conf_threshold)
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        # Parse output
+        for line in result.stdout.split('\n'):
+            if line.startswith("RESULT:"):
+                json_str = line[7:]  # Remove "RESULT:" prefix
+                preds = json.loads(json_str)
+                return np.array(preds) if preds else np.array([])
+        
+        # If no result found, check stderr
+        if result.stderr:
+            print(f"YOLOv9 stderr: {result.stderr}")
+        
+        return np.array([])
+        
+    except subprocess.TimeoutExpired:
+        print("YOLOv9 detection timed out")
+        return np.array([])
+    except Exception as e:
+        print(f"YOLOv9 detection error: {e}")
+        return np.array([])
+    finally:
+        # Cleanup temp file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 def process_frame_simple(frame, model_name, ocr_reader, conf_threshold=0.15):

@@ -23,7 +23,7 @@ def main():
     args = parser.parse_args()
     
     try:
-        # Load model
+        # Load model fresh each time (no caching in subprocess)
         model = torch.hub.load(
             str(YOLOV9_PATH),
             'custom',
@@ -38,15 +38,15 @@ def main():
         results = model(args.image)
         preds = results.xyxy[0].cpu().numpy().tolist()
         
-        # Output as JSON
-        print("RESULT:" + json.dumps(preds))
+        # Output as JSON (flush to ensure it's captured)
+        print("RESULT:" + json.dumps(preds), flush=True)
         
     except Exception as e:
+        import traceback
         print(f"ERROR:{str(e)}", file=sys.stderr)
-        print("RESULT:[]")
+        print(traceback.format_exc(), file=sys.stderr)
+        print("RESULT:[]", flush=True)
 
 if __name__ == "__main__":
     main()
-
-
 
